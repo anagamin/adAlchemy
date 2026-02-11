@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 import logging
 import re
 from pathlib import Path
@@ -19,6 +20,9 @@ from .db import (
     create_request,
     create_results,
     ensure_user,
+    get_last_requests,
+    get_results_for_request,
+    get_user_balance,
     log_action,
 )
 from .models import AdVariant, CampaignDraft
@@ -55,6 +59,8 @@ VK_LINK_PATTERN = re.compile(
 
 BUSY_MESSAGE = "Дождись окончания генерации"
 GENERATION_STATE_KEY = "generation_state"
+INFO_REQUEST_IDS_KEY = "info_request_ids"
+BALANCE_TOPUP_CALLBACK = "balance:topup"
 
 
 def _ensure_user_kwargs(user: User | None) -> dict[str, Any]:
@@ -234,6 +240,33 @@ def _format_campaign_message(draft: CampaignDraft) -> list[str]:
     return chunks
 
 
+def _draft_from_results(rows: list[dict[str, Any]], ad_objective: str = AD_TYPE_SUBSCRIBERS) -> CampaignDraft | None:
+    if not rows:
+        return None
+    draft = CampaignDraft(ad_objective=ad_objective)
+    first_data = rows[0].get("result_data")
+    if first_data:
+        try:
+            data = json.loads(first_data) if isinstance(first_data, str) else first_data
+            draft.keywords = data.get("keywords") or []
+            draft.analysis_result = data.get("analysis_result") or {}
+        except (json.JSONDecodeError, TypeError):
+            pass
+    for r in rows:
+        ad = AdVariant(
+            segment_name=(r.get("segment_name") or "") or "—",
+            headline=(r.get("headline") or "") or "—",
+            body_text=(r.get("body_text") or "") or "",
+            cta=(r.get("cta") or "") or "",
+            visual_concept=(r.get("visual_concept") or "") or "",
+            image_prompt_short=(r.get("image_prompt_short") or "") or "",
+            image_prompt=(r.get("image_prompt") or "") or "",
+            image_path=r.get("pic"),
+        )
+        draft.ads.append(ad)
+    return draft
+
+
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
 PHOTO_MAX_SIZE = 1024
@@ -332,9 +365,69 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user_id is not None:
         await log_action(user_id, LOG_START)
     await update.message.reply_text(
+        "AdAlechemy проводит многофакторный анализ вашей группы VK — контент, аудитория, ниша — и на основе данных генерирует персонализированные рекламные кампании с высокой эффективностью. "
         "Выберите тип объявления:",
         reply_markup=AD_TYPE_KEYBOARD,
     )
+
+
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    user_id = await ensure_user(user.id, **_ensure_user_kwargs(user))
+    if user_id is None:
+        await update.message.reply_text("Не удалось определить пользователя.")
+        return
+    requests_list = await get_last_requests(user_id, limit=50)
+    if not requests_list:
+        await update.message.reply_text("У вас пока нет заказов.")
+        return
+    request_ids = [r["id"] for r in requests_list]
+    context.user_data[INFO_REQUEST_IDS_KEY] = request_ids
+    lines = ["Последние заказы (новые сверху):\n"]
+    for i, r in enumerate(requests_list, 1):
+        link = r.get("link") or "—"
+        created = r.get("created_at")
+        date_str = created.strftime("%d.%m.%Y %H:%M") if hasattr(created, "strftime") else str(created)
+        desc = (r.get("desc") or "").strip() or "—"
+        desc_short = (desc[:80] + "…") if len(desc) > 80 else desc
+        lines.append(f"{i}. {link}")
+        lines.append(f"   Дата: {date_str}")
+        lines.append(f"   Текст: {desc_short}\n")
+    lines.append("Наберите порядковый номер (1–50), чтобы повторно получить сгенерированные варианты по этому заказу.")
+    text = "\n".join(lines)
+    if len(text) > MESSAGE_LIMIT:
+        parts = [text[i : i + MESSAGE_LIMIT] for i in range(0, len(text), MESSAGE_LIMIT)]
+        for part in parts:
+            await update.message.reply_text(part)
+    else:
+        await update.message.reply_text(text)
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    await ensure_user(user.id, **_ensure_user_kwargs(user))
+    balance = await get_user_balance(user.id)
+    if balance is None:
+        balance = 0
+    balance_str = f"{balance:.2f}" if isinstance(balance, (int, float)) else str(balance)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Пополнить баланс", callback_data=BALANCE_TOPUP_CALLBACK)],
+    ])
+    await update.message.reply_text(
+        f"Ваш текущий баланс: {balance_str}",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_balance_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.data == BALANCE_TOPUP_CALLBACK:
+        await query.edit_message_reply_markup(reply_markup=None)
 
 
 async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -377,7 +470,22 @@ async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    link, user_wishes = parse_user_input(update.message.text or "")
+    text = (update.message.text or "").strip()
+    request_ids: list[int] = context.user_data.get(INFO_REQUEST_IDS_KEY) or []
+    if request_ids and text.isdigit():
+        num = int(text)
+        if 1 <= num <= len(request_ids):
+            request_id = request_ids[num - 1]
+            context.user_data.pop(INFO_REQUEST_IDS_KEY, None)
+            rows = await get_results_for_request(request_id)
+            draft = _draft_from_results(rows) if rows else None
+            if draft and draft.ads:
+                await update.message.reply_text("Повторная выдача по заказу:")
+                await _send_campaign(update.effective_chat.id, draft, context.application)
+            else:
+                await update.message.reply_text("По этому заказу нет сохранённых вариантов.")
+            return
+    link, user_wishes = parse_user_input(text)
     if not link:
         await update.message.reply_text(
             "Отправьте корректную ссылку на группу ВКонтакте (содержит vk.com). "
@@ -436,6 +544,9 @@ def build_application() -> Application:
         .build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("info", cmd_info))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CallbackQueryHandler(handle_balance_topup, pattern=f"^{re.escape(BALANCE_TOPUP_CALLBACK)}$"))
     app.add_handler(CallbackQueryHandler(handle_ad_type, pattern=f"^({AD_TYPE_SUBSCRIBERS}|{AD_TYPE_MESSAGES})$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     return app

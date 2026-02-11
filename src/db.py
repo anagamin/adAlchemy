@@ -247,3 +247,53 @@ async def log_action(user_id: int, desc: str) -> None:
                 "INSERT INTO log (user_id, `desc`) VALUES (%s, %s)",
                 (user_id, desc),
             )
+
+
+async def get_user_balance(telegram_id: int) -> Optional[Any]:
+    await init_pool_if_needed()
+    if not _pool_ready():
+        return None
+    async with get_conn() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT balance FROM users WHERE telegram_id = %s",
+                (telegram_id,),
+            )
+            row = await cur.fetchone()
+            return row["balance"] if row else None
+
+
+async def get_last_requests(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    await init_pool_if_needed()
+    if not _pool_ready():
+        return []
+    async with get_conn() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                """SELECT id, link, `desc`, created_at
+                   FROM requests
+                   WHERE user_id = %s
+                   ORDER BY created_at DESC
+                   LIMIT %s""",
+                (user_id, limit),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def get_results_for_request(request_id: int) -> list[dict[str, Any]]:
+    await init_pool_if_needed()
+    if not _pool_ready():
+        return []
+    async with get_conn() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                """SELECT id, pic, segment_name, headline, body_text, cta,
+                          visual_concept, image_prompt_short, image_prompt, result_data
+                   FROM results
+                   WHERE request_id = %s
+                   ORDER BY id ASC""",
+                (request_id,),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
