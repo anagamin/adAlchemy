@@ -53,6 +53,9 @@ VK_LINK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+BUSY_MESSAGE = "Дождись окончания генерации"
+GENERATION_STATE_KEY = "generation_state"
+
 
 def _ensure_user_kwargs(user: User | None) -> dict[str, Any]:
     if user is None:
@@ -65,6 +68,50 @@ def _ensure_user_kwargs(user: User | None) -> dict[str, Any]:
         "is_bot": user.is_bot,
         "is_premium": getattr(user, "is_premium", None),
     }
+
+
+def _get_generation_state(app: Application) -> dict[int, dict[str, Any]]:
+    state = app.bot_data.get(GENERATION_STATE_KEY)
+    if not isinstance(state, dict):
+        state = {}
+        app.bot_data[GENERATION_STATE_KEY] = state
+    return state
+
+
+def _is_generation_active(app: Application, chat_id: int) -> bool:
+    state = _get_generation_state(app)
+    data = state.get(chat_id)
+    return bool(data and data.get("active"))
+
+
+def _register_generation(app: Application, chat_id: int, request_id: int | None) -> None:
+    state = _get_generation_state(app)
+    state[chat_id] = {"active": True, "request_id": request_id, "result_sent": False}
+
+
+def _should_send_results(app: Application, chat_id: int, request_id: int | None) -> bool:
+    state = _get_generation_state(app)
+    data = state.get(chat_id)
+    if not data:
+        return True
+    if data.get("result_sent"):
+        return False
+    stored_request_id = data.get("request_id")
+    if stored_request_id is not None and request_id is not None and stored_request_id != request_id:
+        return False
+    return True
+
+
+def _mark_results_sent(app: Application, chat_id: int) -> None:
+    state = _get_generation_state(app)
+    data = state.get(chat_id)
+    if data is not None:
+        data["result_sent"] = True
+
+
+def _clear_generation_state(app: Application, chat_id: int) -> None:
+    state = _get_generation_state(app)
+    state.pop(chat_id, None)
 
 
 def parse_user_input(text: str) -> tuple[str | None, str | None]:
@@ -111,8 +158,13 @@ async def _run_campaign_task(
             await create_results(request_id, draft)
         if user_id is not None:
             await log_action(user_id, LOG_ORDER_DONE)
-        logger.info("task: campaign generated, sending to user")
-        await _send_campaign(chat_id, draft, app)
+        logger.info("task: campaign generated, evaluating send guard")
+        if _should_send_results(app, chat_id, request_id):
+            logger.info("task: sending campaign to chat_id=%s", chat_id)
+            await _send_campaign(chat_id, draft, app)
+            _mark_results_sent(app, chat_id)
+        else:
+            logger.info("task: duplicate results suppressed chat_id=%s request_id=%s", chat_id, request_id)
         logger.info("task done chat_id=%s", chat_id)
     except ValueError as e:
         logger.warning("task error (ValueError): %s", e)
@@ -120,6 +172,8 @@ async def _run_campaign_task(
     except Exception as e:
         logger.exception("task failed: %s", e)
         await app.bot.send_message(chat_id=chat_id, text=f"Произошла ошибка: {e}")
+    finally:
+        _clear_generation_state(app, chat_id)
 
 
 def _format_ad_block(ad: AdVariant, index: int, draft: CampaignDraft) -> str:
@@ -147,13 +201,21 @@ def _format_ad_block(ad: AdVariant, index: int, draft: CampaignDraft) -> str:
         "",
         f"Визуальная концепция: {ad.visual_concept}",
         "",
+    ]
+    if getattr(ad, "reasoning", "") and ad.reasoning.strip():
+        lines.extend([
+            "💡 Почему этот вариант:",
+            ad.reasoning.strip(),
+            "",
+        ])
+    lines.extend([
         "── Параметры для создания объявления ──",
         f"Цель кампании: {objective_text}",
         f"Регионы: {regions_text}",
         f"Возраст: {age_range}",
         f"Пол: {gender_text}",
         "",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -254,10 +316,21 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    user_id = None
     if user:
         user_id = await ensure_user(user.id, **_ensure_user_kwargs(user))
-        if user_id is not None:
-            await log_action(user_id, LOG_START)
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    app = context.application
+    if chat_id is not None and _is_generation_active(app, chat_id):
+        logger.info("start: generation active chat_id=%s, informing user", chat_id)
+        if update.message:
+            await update.message.reply_text(BUSY_MESSAGE)
+        else:
+            await app.bot.send_message(chat_id=chat_id, text=BUSY_MESSAGE)
+        return
+    if user_id is not None:
+        await log_action(user_id, LOG_START)
     await update.message.reply_text(
         "Выберите тип объявления:",
         reply_markup=AD_TYPE_KEYBOARD,
@@ -272,6 +345,11 @@ async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         ad_type = AD_TYPE_SUBSCRIBERS
     context.user_data["ad_type"] = ad_type
     chat_id = update.effective_chat.id
+    app = context.application
+    if _is_generation_active(app, chat_id):
+        logger.info("handle_ad_type: generation active chat_id=%s, ignoring new selection", chat_id)
+        await app.bot.send_message(chat_id=chat_id, text=BUSY_MESSAGE)
+        return
     pending_link = context.user_data.pop("pending_link", None)
     pending_wishes = context.user_data.pop("pending_wishes", None)
 
@@ -287,7 +365,7 @@ async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if pending_link:
         await query.edit_message_text(CREATING_MESSAGE)
-        app = context.application
+        _register_generation(app, chat_id, request_id)
         asyncio.create_task(
             _run_campaign_task(chat_id, pending_link, app, pending_wishes, ad_type, user_id, request_id)
         )
@@ -308,6 +386,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     chat_id = update.effective_chat.id
+    app = context.application
+    if _is_generation_active(app, chat_id):
+        logger.info("handle_link: generation active chat_id=%s, suppressing new request", chat_id)
+        await update.message.reply_text(BUSY_MESSAGE)
+        return
     ad_type = context.user_data.get("ad_type")
     if ad_type is None:
         context.user_data["pending_link"] = link
@@ -331,7 +414,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await update.message.reply_text(CREATING_MESSAGE)
 
-    app = context.application
+    _register_generation(app, chat_id, request_id)
     asyncio.create_task(
         _run_campaign_task(chat_id, link, app, user_wishes, ad_type, user_id, request_id)
     )

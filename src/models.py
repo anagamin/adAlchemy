@@ -40,6 +40,7 @@ class AdVariant:
     image_prompt_short: str
     image_prompt: str = ""
     image_path: Optional[str] = None
+    reasoning: str = ""
 
 
 AdObjective = str  # "subscribers" | "messages"

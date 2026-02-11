@@ -139,6 +139,7 @@ async def generate_campaign(
         cta = a.get("cta") or ""
         visual_concept = a.get("visual_concept") or ""
         image_prompt_short = a.get("image_prompt_short") or ""
+        reasoning = a.get("reasoning") or ""
         seg_desc = _segment_description(analysis_result, segment_name)
         image_prompt = await _step3_image_prompt(headline, visual_concept, seg_desc)
         ad_variants.append(
@@ -150,6 +151,7 @@ async def generate_campaign(
                 visual_concept=visual_concept,
                 image_prompt_short=image_prompt_short,
                 image_prompt=image_prompt,
+                reasoning=reasoning,
             )
         )
 
