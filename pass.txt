@@ -1,0 +1,4 @@
+90.156.203.178
+root
+9U7y:4Bz@@
+python -m pip install -r requirements.txt
