@@ -40,7 +40,9 @@ def _segment_description(analysis_result: dict, segment_name: str) -> str:
     return segment_name
 
 
-async def _step1_analysis(analysis: GroupAnalysis) -> dict[str, Any]:
+async def _step1_analysis(
+    analysis: GroupAnalysis, user_wishes: str | None = None
+) -> dict[str, Any]:
     logger.info("campaign: step1_analysis start group=%s", analysis.group.name)
     top = _top_posts_for_prompt(analysis)
     user = build_user_analysis(
@@ -48,6 +50,7 @@ async def _step1_analysis(analysis: GroupAnalysis) -> dict[str, Any]:
         analysis.group.description,
         analysis.group.members_count,
         top,
+        user_wishes=user_wishes,
     )
     raw = await chat_completion(
         [{"role": "system", "content": SYSTEM_ANALYSIS}, {"role": "user", "content": user}],
@@ -76,10 +79,12 @@ async def _step1_analysis(analysis: GroupAnalysis) -> dict[str, Any]:
     return out
 
 
-async def _step2_ads(analysis_result: dict) -> list[dict[str, Any]]:
+async def _step2_ads(
+    analysis_result: dict, user_wishes: str | None = None
+) -> list[dict[str, Any]]:
     logger.info("campaign: step2_ads start")
     analysis_json = json.dumps(analysis_result, ensure_ascii=False, indent=2)
-    user = build_user_ads(analysis_json)
+    user = build_user_ads(analysis_json, user_wishes=user_wishes)
     raw = await chat_completion(
         [{"role": "system", "content": SYSTEM_ADS}, {"role": "user", "content": user}],
         json_mode=True,
@@ -109,10 +114,14 @@ async def _step3_image_prompt(
     return raw.strip()
 
 
-async def generate_campaign(analysis: GroupAnalysis, image_path: Optional[Path] = None) -> CampaignDraft:
+async def generate_campaign(
+    analysis: GroupAnalysis,
+    image_path: Optional[Path] = None,
+    user_wishes: Optional[str] = None,
+) -> CampaignDraft:
     logger.info("campaign: generate_campaign start")
-    analysis_result = await _step1_analysis(analysis)
-    ads_raw = await _step2_ads(analysis_result)
+    analysis_result = await _step1_analysis(analysis, user_wishes=user_wishes)
+    ads_raw = await _step2_ads(analysis_result, user_wishes=user_wishes)
     keywords = analysis_result.get("keywords") or []
 
     ad_variants: list[AdVariant] = []
