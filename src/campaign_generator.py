@@ -41,9 +41,11 @@ def _segment_description(analysis_result: dict, segment_name: str) -> str:
 
 
 async def _step1_analysis(
-    analysis: GroupAnalysis, user_wishes: str | None = None
+    analysis: GroupAnalysis,
+    user_wishes: str | None = None,
+    ad_objective: str = "subscribers",
 ) -> dict[str, Any]:
-    logger.info("campaign: step1_analysis start group=%s", analysis.group.name)
+    logger.info("campaign: step1_analysis start group=%s objective=%s", analysis.group.name, ad_objective)
     top = _top_posts_for_prompt(analysis)
     user = build_user_analysis(
         analysis.group.name,
@@ -51,6 +53,7 @@ async def _step1_analysis(
         analysis.group.members_count,
         top,
         user_wishes=user_wishes,
+        ad_objective=ad_objective,
     )
     raw = await chat_completion(
         [{"role": "system", "content": SYSTEM_ANALYSIS}, {"role": "user", "content": user}],
@@ -61,6 +64,7 @@ async def _step1_analysis(
     except Exception as e:
         logger.warning("campaign: step1 extract_json failed: %s | raw_preview=%s", e, (raw or "")[:800])
         raise
+    out["ad_objective"] = ad_objective
     if not out.get("vk_campaign"):
         out["vk_campaign"] = {
             "campaign_name": out.get("project_summary", "Кампания")[:80] or "Кампания",
@@ -80,11 +84,13 @@ async def _step1_analysis(
 
 
 async def _step2_ads(
-    analysis_result: dict, user_wishes: str | None = None
+    analysis_result: dict,
+    user_wishes: str | None = None,
+    ad_objective: str = "subscribers",
 ) -> list[dict[str, Any]]:
-    logger.info("campaign: step2_ads start")
+    logger.info("campaign: step2_ads start objective=%s", ad_objective)
     analysis_json = json.dumps(analysis_result, ensure_ascii=False, indent=2)
-    user = build_user_ads(analysis_json, user_wishes=user_wishes)
+    user = build_user_ads(analysis_json, user_wishes=user_wishes, ad_objective=ad_objective)
     raw = await chat_completion(
         [{"role": "system", "content": SYSTEM_ADS}, {"role": "user", "content": user}],
         json_mode=True,
@@ -118,10 +124,11 @@ async def generate_campaign(
     analysis: GroupAnalysis,
     image_path: Optional[Path] = None,
     user_wishes: Optional[str] = None,
+    ad_objective: str = "subscribers",
 ) -> CampaignDraft:
-    logger.info("campaign: generate_campaign start")
-    analysis_result = await _step1_analysis(analysis, user_wishes=user_wishes)
-    ads_raw = await _step2_ads(analysis_result, user_wishes=user_wishes)
+    logger.info("campaign: generate_campaign start objective=%s", ad_objective)
+    analysis_result = await _step1_analysis(analysis, user_wishes=user_wishes, ad_objective=ad_objective)
+    ads_raw = await _step2_ads(analysis_result, user_wishes=user_wishes, ad_objective=ad_objective)
     keywords = analysis_result.get("keywords") or []
 
     ad_variants: list[AdVariant] = []
@@ -171,4 +178,5 @@ async def generate_campaign(
         analysis_result=analysis_result,
         ads=ad_variants,
         keywords=keywords,
+        ad_objective=ad_objective,
     )

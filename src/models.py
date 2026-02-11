@@ -42,11 +42,15 @@ class AdVariant:
     image_path: Optional[str] = None
 
 
+AdObjective = str  # "subscribers" | "messages"
+
+
 @dataclass
 class CampaignDraft:
     analysis_result: dict[str, Any] = field(default_factory=dict)
     ads: list[AdVariant] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
+    ad_objective: AdObjective = "subscribers"
     image_path: Optional[str] = None
     image_url: Optional[str] = None
     audience_description: str = ""

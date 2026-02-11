@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 
 from PIL import Image
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .campaign_generator import generate_campaign
 from .config import settings
@@ -16,6 +16,26 @@ from .vk_client import fetch_group_analysis
 logger = logging.getLogger(__name__)
 
 CREATING_MESSAGE = "Ваше объявление создаётся. Вы получите результат, когда всё будет готово."
+
+AD_TYPE_SUBSCRIBERS = "subscribers"
+AD_TYPE_MESSAGES = "messages"
+
+AD_TYPE_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("Привлечь подписчиков", callback_data=AD_TYPE_SUBSCRIBERS)],
+    [InlineKeyboardButton("Принять заказы в сообщениях", callback_data=AD_TYPE_MESSAGES)],
+])
+
+REGION_IDS_TO_NAMES: dict[str, str] = {
+    "1": "Вся Россия",
+    "77": "Москва",
+    "78": "Санкт-Петербург",
+    "1019": "Московская область",
+    "2": "Санкт-Петербург и ЛО",
+    "11119": "Краснодарский край",
+    "11029": "Свердловская область",
+    "54": "Татарстан",
+    "10995": "Нижегородская область",
+}
 
 VK_LINK_PATTERN = re.compile(
     r"(https?://)?(www\.)?vk\.com/[^\s]+",
@@ -40,15 +60,27 @@ def parse_user_input(text: str) -> tuple[str | None, str | None]:
     return link, rest or None
 
 
+def _region_ids_to_text(region_ids: str | None) -> str:
+    if not region_ids:
+        return "—"
+    parts = [p.strip() for p in str(region_ids).split(",") if p.strip()]
+    names = [REGION_IDS_TO_NAMES.get(p, p) for p in parts]
+    return ", ".join(names) if names else region_ids
+
+
 async def _run_campaign_task(
-    chat_id: int, link: str, app: Application, user_wishes: str | None = None
+    chat_id: int,
+    link: str,
+    app: Application,
+    user_wishes: str | None = None,
+    ad_type: str = AD_TYPE_SUBSCRIBERS,
 ) -> None:
-    logger.info("task start chat_id=%s link=%s", chat_id, link)
+    logger.info("task start chat_id=%s link=%s ad_type=%s", chat_id, link, ad_type)
     try:
         logger.info("task: fetching VK group analysis")
         analysis = fetch_group_analysis(link, posts_count=50)
         logger.info("task: VK done group=%s posts=%s", analysis.group.name, len(analysis.posts))
-        draft = await generate_campaign(analysis, user_wishes=user_wishes)
+        draft = await generate_campaign(analysis, user_wishes=user_wishes, ad_objective=ad_type)
         logger.info("task: campaign generated, sending to user")
         await _send_campaign(chat_id, draft, app)
         logger.info("task done chat_id=%s", chat_id)
@@ -60,21 +92,36 @@ async def _run_campaign_task(
         await app.bot.send_message(chat_id=chat_id, text=f"Произошла ошибка: {e}")
 
 
-def _format_ad_block(ad: AdVariant, index: int) -> str:
+def _format_ad_block(ad: AdVariant, index: int, draft: CampaignDraft) -> str:
+    vk = draft.analysis_result.get("vk_campaign") or {}
+    segments = draft.analysis_result.get("audience_segments") or []
+    seg = segments[index - 1] if index <= len(segments) else {}
+    age_range = seg.get("age_range") or f"{vk.get('age_from', 18)}–{vk.get('age_to', 55)}"
+    gender_raw = (seg.get("gender") or "all").lower()
+    gender_text = "мужской" if gender_raw == "male" else "женский" if gender_raw == "female" else "все"
+    regions_text = _region_ids_to_text(vk.get("region_ids"))
+    objective_text = (
+        "Привлечь подписчиков" if draft.ad_objective == AD_TYPE_SUBSCRIBERS else "Принять заказы в сообщениях"
+    )
+
     lines = [
         f"━━━ Вариант {index} · {ad.segment_name} ━━━",
+        "",
+        "Целевая аудитория: " + (ad.segment_name or "—"),
         "",
         f"📌 Заголовок: {ad.headline}",
         "",
         "Текст:",
         ad.body_text,
         "",
-        f"CTA: {ad.cta}",
         "",
         f"Визуальная концепция: {ad.visual_concept}",
         "",
-        "🖼 Промпт для генерации изображения:",
-        ad.image_prompt,
+        "── Параметры для создания объявления ──",
+        f"Цель кампании: {objective_text}",
+        f"Регионы: {regions_text}",
+        f"Возраст: {age_range}",
+        f"Пол: {gender_text}",
         "",
     ]
     return "\n".join(lines)
@@ -89,62 +136,10 @@ def _format_campaign_message(draft: CampaignDraft) -> list[str]:
         chunks.append("🏷 Ключевые слова для таргета: " + ", ".join(draft.keywords[:20]))
 
     for i, ad in enumerate(draft.ads, 1):
-        block = _format_ad_block(ad, i)
+        block = _format_ad_block(ad, i, draft)
         chunks.append(block)
 
     return chunks
-
-
-def _format_campaign_data_for_manual_create(draft: CampaignDraft) -> str:
-    """Формирует текстовый блок со всеми данными для ручного создания кампании в VK Рекламе."""
-    vk = draft.analysis_result.get("vk_campaign") or {}
-    lines = [
-        "═══════════════════════════════════════",
-        "📋 ДАННЫЕ ДЛЯ РУЧНОГО СОЗДАНИЯ КАМПАНИИ",
-        "═══════════════════════════════════════",
-        "",
-        "── КАМПАНИЯ ──",
-        f"Название: {vk.get('campaign_name') or draft.analysis_result.get('project_summary', 'Кампания') or 'Кампания'}",
-        f"Дневной бюджет (руб): {vk.get('budget_daily_rub') or 500}",
-        f"Общий бюджет (руб, 0 = без лимита): {vk.get('budget_total_rub') or 0}",
-        f"Тип ставки: {vk.get('bid_type') or 'cpc'}",
-        f"Ставка (руб): {vk.get('bid_rub') or 15}",
-        f"Ссылка (куда ведёт реклама): {vk.get('link_url') or 'https://vk.com'}",
-        f"Страна (код): {vk.get('country') or '1'}",
-        f"Регионы (коды через запятую): {vk.get('region_ids') or '—'}",
-        f"Интересы (ID через запятую): {vk.get('interest_ids') or '—'}",
-        f"Возраст: от {vk.get('age_from', 18)} до {vk.get('age_to', 55)}",
-        "",
-    ]
-    segments = draft.analysis_result.get("audience_segments") or []
-    if not segments and draft.ads:
-        segments = [{"segment_name": ad.segment_name, "gender": "", "age_range": ""} for ad in draft.ads]
-    if segments:
-        lines.append("── ГРУППЫ ОБЪЯВЛЕНИЙ (ТАРГЕТИНГ) ──")
-        for i, seg in enumerate(segments, 1):
-            name = seg.get("segment_name") or f"Группа {i}"
-            age = seg.get("age_range") or f"{vk.get('age_from', 18)}–{vk.get('age_to', 55)}"
-            gender = seg.get("gender") or "все"
-            lines.append(f"{i}. {name}")
-            lines.append(f"   Возраст: {age}, пол: {gender}")
-            lines.append("")
-    lines.append("── ОБЪЯВЛЕНИЯ (для ввода в кабинете) ──")
-    link_url = vk.get("link_url") or "https://vk.com"
-    for i, ad in enumerate(draft.ads, 1):
-        lines.append(f"{i}. Название: {(ad.headline or ad.segment_name or f'Объявление {i}')[:100]}")
-        lines.append(f"   Заголовок: {(ad.headline or '')[:80]}")
-        lines.append(f"   Текст: {(ad.body_text or '')[:800]}")
-        lines.append(f"   Ссылка: {link_url}")
-        lines.append("")
-    if not draft.ads:
-        name = vk.get("campaign_name") or draft.analysis_result.get("project_summary", "Кампания") or "Кампания"
-        lines.append(f"1. Название: {name[:100]}")
-        lines.append(f"   Заголовок: {name[:80]}")
-        lines.append("   Текст: (введите вручную)")
-        lines.append(f"   Ссылка: {link_url}")
-        lines.append("")
-    lines.append("═══════════════════════════════════════")
-    return "\n".join(lines)
 
 
 CAPTION_LIMIT = 1024
@@ -180,8 +175,7 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
             await app.bot.send_message(chat_id=chat_id, text=part)
 
     for i, ad in enumerate(draft.ads):
-        block = chunks[summary_count + i] if summary_count + i < len(chunks) else _format_ad_block(ad, i + 1)
-        caption = block[:CAPTION_LIMIT]
+        block = chunks[summary_count + i] if summary_count + i < len(chunks) else _format_ad_block(ad, i + 1, draft)
         if ad.image_path:
             photo_bytes = None
             try:
@@ -189,10 +183,11 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
             except Exception as e:
                 logger.warning("prepare_photo for ad %s failed: %s", i + 1, e)
             if photo_bytes:
+                short_caption = f"Вариант {i + 1} · {ad.segment_name}"
                 last_error = None
                 for attempt in range(1, PHOTO_SEND_RETRIES + 1):
                     try:
-                        await app.bot.send_photo(chat_id=chat_id, photo=photo_bytes, caption=caption)
+                        await app.bot.send_photo(chat_id=chat_id, photo=photo_bytes, caption=short_caption)
                         last_error = None
                         break
                     except Exception as e:
@@ -202,8 +197,22 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
                             await asyncio.sleep(PHOTO_SEND_RETRY_DELAY)
                 if last_error is not None:
                     await app.bot.send_message(chat_id=chat_id, text=block)
+                else:
+                    if len(block) > MESSAGE_LIMIT:
+                        start = 0
+                        while start < len(block):
+                            await app.bot.send_message(chat_id=chat_id, text=block[start : start + MESSAGE_LIMIT])
+                            start += MESSAGE_LIMIT
+                    else:
+                        await app.bot.send_message(chat_id=chat_id, text=block)
             else:
-                await app.bot.send_message(chat_id=chat_id, text=block)
+                if len(block) > MESSAGE_LIMIT:
+                    start = 0
+                    while start < len(block):
+                        await app.bot.send_message(chat_id=chat_id, text=block[start : start + MESSAGE_LIMIT])
+                        start += MESSAGE_LIMIT
+                else:
+                    await app.bot.send_message(chat_id=chat_id, text=block)
         else:
             if len(block) > MESSAGE_LIMIT:
                 start = 0
@@ -213,25 +222,33 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
             else:
                 await app.bot.send_message(chat_id=chat_id, text=block)
 
-    text_block = _format_campaign_data_for_manual_create(draft)
-    await app.bot.send_message(chat_id=chat_id, text="📋 Данные для ручного создания кампании в VK Рекламе:")
-    if len(text_block) > MESSAGE_LIMIT:
-        start = 0
-        while start < len(text_block):
-            segment = text_block[start : start + MESSAGE_LIMIT]
-            await app.bot.send_message(chat_id=chat_id, text=segment)
-            start += MESSAGE_LIMIT
-    else:
-        await app.bot.send_message(chat_id=chat_id, text=text_block)
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Отправьте ссылку на группу ВКонтакте (например, vk.com/group_name или vk.com/club123). "
-        "Вместе со ссылкой можно добавить текст с пожеланиями и рекомендациями по рекламной кампании — "
-        "например, акцент на скидках, тоне сообщений или целевой аудитории. "
-        "Я проанализирую группу и последние 50 постов и подготовлю данные для рекламной кампании с учётом ваших пожеланий."
+        "Выберите тип объявления:",
+        reply_markup=AD_TYPE_KEYBOARD,
     )
+
+
+async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    ad_type = query.data
+    if ad_type not in (AD_TYPE_SUBSCRIBERS, AD_TYPE_MESSAGES):
+        ad_type = AD_TYPE_SUBSCRIBERS
+    context.user_data["ad_type"] = ad_type
+    chat_id = update.effective_chat.id
+    pending_link = context.user_data.pop("pending_link", None)
+    pending_wishes = context.user_data.pop("pending_wishes", None)
+
+    if pending_link:
+        await query.edit_message_text(CREATING_MESSAGE)
+        app = context.application
+        asyncio.create_task(_run_campaign_task(chat_id, pending_link, app, pending_wishes, ad_type))
+    else:
+        await query.edit_message_text(
+            "Тип объявления выбран. Отправьте ссылку на группу ВКонтакте (например, vk.com/group_name или vk.com/club123). "
+            "Можно добавить текст с пожеланиями по рекламной кампании."
+        )
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -244,11 +261,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     chat_id = update.effective_chat.id
-    logger.info("handle_link chat_id=%s link=%s wishes=%s", chat_id, link, bool(user_wishes))
+    ad_type = context.user_data.get("ad_type")
+    if ad_type is None:
+        context.user_data["pending_link"] = link
+        context.user_data["pending_wishes"] = user_wishes
+        await update.message.reply_text(
+            "Сначала выберите тип объявления:",
+            reply_markup=AD_TYPE_KEYBOARD,
+        )
+        return
+
+    logger.info("handle_link chat_id=%s link=%s wishes=%s ad_type=%s", chat_id, link, bool(user_wishes), ad_type)
     await update.message.reply_text(CREATING_MESSAGE)
 
     app = context.application
-    asyncio.create_task(_run_campaign_task(chat_id, link, app, user_wishes))
+    asyncio.create_task(_run_campaign_task(chat_id, link, app, user_wishes, ad_type))
 
 
 def build_application() -> Application:
@@ -267,6 +294,7 @@ def build_application() -> Application:
         .build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_ad_type, pattern=f"^({AD_TYPE_SUBSCRIBERS}|{AD_TYPE_MESSAGES})$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     return app
 
