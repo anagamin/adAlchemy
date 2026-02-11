@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
+from .config import settings
+from .image_client import generate_image
 from .llm_client import chat_completion, extract_json_from_text
 from .models import AdVariant, CampaignDraft, GroupAnalysis
 from .prompts import (
@@ -135,10 +137,23 @@ async def generate_campaign(analysis: GroupAnalysis, image_path: Optional[Path] 
             )
         )
 
+    generated_image_path: Optional[Path] = image_path
+    if settings.gptunnel_api_key and ad_variants:
+        first_prompt = ad_variants[0].image_prompt
+        if first_prompt:
+            try:
+                generated_image_path = await generate_image(
+                    first_prompt,
+                    aspect_ratio="1:1",
+                    output_path=image_path,
+                )
+            except Exception as e:
+                logger.warning("campaign: image generation failed: %s", e)
+
     logger.info("campaign: generate_campaign done ads=%s", len(ad_variants))
     return CampaignDraft(
         analysis_result=analysis_result,
         ads=ad_variants,
         keywords=keywords,
-        image_path=str(image_path) if image_path and image_path.exists() else None,
+        image_path=str(generated_image_path) if generated_image_path and Path(generated_image_path).exists() else None,
     )

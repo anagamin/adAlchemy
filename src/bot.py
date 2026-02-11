@@ -74,6 +74,41 @@ MESSAGE_LIMIT = 4096
 
 async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -> None:
     chunks = _format_campaign_message(draft)
+    if draft.image_path:
+        try:
+            with open(draft.image_path, "rb") as f:
+                await app.bot.send_photo(chat_id=chat_id, photo=f, caption=chunks[0][:CAPTION_LIMIT] if chunks else None)
+            for part in chunks[1:]:
+                if len(part) > MESSAGE_LIMIT:
+                    start = 0
+                    while start < len(part):
+                        await app.bot.send_message(chat_id=chat_id, text=part[start : start + MESSAGE_LIMIT])
+                        start += MESSAGE_LIMIT
+                else:
+                    await app.bot.send_message(chat_id=chat_id, text=part)
+        except Exception as e:
+            logger.warning("send_photo failed, falling back to text: %s", e)
+            for part in chunks:
+                if len(part) > MESSAGE_LIMIT:
+                    start = 0
+                    while start < len(part):
+                        await app.bot.send_message(chat_id=chat_id, text=part[start : start + MESSAGE_LIMIT])
+                        start += MESSAGE_LIMIT
+                else:
+                    await app.bot.send_message(chat_id=chat_id, text=part)
+        vk_requests = build_vk_ads_requests(draft)
+        api_payload = {"vk_ads_api_requests": vk_requests}
+        json_text = json.dumps(api_payload, ensure_ascii=False, indent=2)
+        await app.bot.send_message(chat_id=chat_id, text="📤 Запросы в VK Ads API (JSON):")
+        if len(json_text) > MESSAGE_LIMIT:
+            start = 0
+            while start < len(json_text):
+                await app.bot.send_message(chat_id=chat_id, text=json_text[start : start + MESSAGE_LIMIT])
+                start += MESSAGE_LIMIT
+        else:
+            await app.bot.send_message(chat_id=chat_id, text=json_text)
+        return
+
     for part in chunks:
         if len(part) > MESSAGE_LIMIT:
             start = 0
