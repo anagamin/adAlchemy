@@ -1,6 +1,10 @@
 import asyncio
+import io
 import json
 import logging
+from pathlib import Path
+
+from PIL import Image
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -70,54 +74,52 @@ def _format_campaign_message(draft: CampaignDraft) -> list[str]:
 
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
+PHOTO_MAX_SIZE = 1280
+PHOTO_JPEG_QUALITY = 88
+
+
+def _prepare_photo_for_telegram(path: str) -> bytes:
+    with Image.open(path) as img:
+        img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > PHOTO_MAX_SIZE:
+            ratio = PHOTO_MAX_SIZE / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY, optimize=True)
+        return buf.getvalue()
 
 
 async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -> None:
     chunks = _format_campaign_message(draft)
-    if draft.image_path:
-        try:
-            with open(draft.image_path, "rb") as f:
-                await app.bot.send_photo(chat_id=chat_id, photo=f, caption=chunks[0][:CAPTION_LIMIT] if chunks else None)
-            for part in chunks[1:]:
-                if len(part) > MESSAGE_LIMIT:
-                    start = 0
-                    while start < len(part):
-                        await app.bot.send_message(chat_id=chat_id, text=part[start : start + MESSAGE_LIMIT])
-                        start += MESSAGE_LIMIT
-                else:
-                    await app.bot.send_message(chat_id=chat_id, text=part)
-        except Exception as e:
-            logger.warning("send_photo failed, falling back to text: %s", e)
-            for part in chunks:
-                if len(part) > MESSAGE_LIMIT:
-                    start = 0
-                    while start < len(part):
-                        await app.bot.send_message(chat_id=chat_id, text=part[start : start + MESSAGE_LIMIT])
-                        start += MESSAGE_LIMIT
-                else:
-                    await app.bot.send_message(chat_id=chat_id, text=part)
-        vk_requests = build_vk_ads_requests(draft)
-        api_payload = {"vk_ads_api_requests": vk_requests}
-        json_text = json.dumps(api_payload, ensure_ascii=False, indent=2)
-        await app.bot.send_message(chat_id=chat_id, text="📤 Запросы в VK Ads API (JSON):")
-        if len(json_text) > MESSAGE_LIMIT:
-            start = 0
-            while start < len(json_text):
-                await app.bot.send_message(chat_id=chat_id, text=json_text[start : start + MESSAGE_LIMIT])
-                start += MESSAGE_LIMIT
-        else:
-            await app.bot.send_message(chat_id=chat_id, text=json_text)
-        return
-
-    for part in chunks:
+    summary_count = 2 if draft.keywords else 1
+    for i, part in enumerate(chunks[:summary_count]):
         if len(part) > MESSAGE_LIMIT:
             start = 0
             while start < len(part):
-                segment = part[start : start + MESSAGE_LIMIT]
-                await app.bot.send_message(chat_id=chat_id, text=segment)
+                await app.bot.send_message(chat_id=chat_id, text=part[start : start + MESSAGE_LIMIT])
                 start += MESSAGE_LIMIT
         else:
             await app.bot.send_message(chat_id=chat_id, text=part)
+
+    for i, ad in enumerate(draft.ads):
+        block = chunks[summary_count + i] if summary_count + i < len(chunks) else _format_ad_block(ad, i + 1)
+        caption = block[:CAPTION_LIMIT]
+        if ad.image_path:
+            try:
+                photo_bytes = _prepare_photo_for_telegram(ad.image_path)
+                await app.bot.send_photo(chat_id=chat_id, photo=photo_bytes, caption=caption)
+            except Exception as e:
+                logger.warning("send_photo for ad %s failed: %s", i + 1, e)
+                await app.bot.send_message(chat_id=chat_id, text=block)
+        else:
+            if len(block) > MESSAGE_LIMIT:
+                start = 0
+                while start < len(block):
+                    await app.bot.send_message(chat_id=chat_id, text=block[start : start + MESSAGE_LIMIT])
+                    start += MESSAGE_LIMIT
+            else:
+                await app.bot.send_message(chat_id=chat_id, text=block)
 
     vk_requests = build_vk_ads_requests(draft)
     api_payload = {"vk_ads_api_requests": vk_requests}
@@ -155,9 +157,18 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def build_application() -> Application:
+    from telegram.request import HTTPXRequest
+
+    request = HTTPXRequest(
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=10,
+        media_write_timeout=90,
+    )
     app = (
         Application.builder()
         .token(settings.telegram_bot_token)
+        .request(request)
         .build()
     )
     app.add_handler(CommandHandler("start", start))

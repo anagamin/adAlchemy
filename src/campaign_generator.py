@@ -137,23 +137,29 @@ async def generate_campaign(analysis: GroupAnalysis, image_path: Optional[Path] 
             )
         )
 
-    generated_image_path: Optional[Path] = image_path
-    if settings.gptunnel_api_key and ad_variants:
-        first_prompt = ad_variants[0].image_prompt
-        if first_prompt:
+    if settings.gptunnel_api_key:
+        for i, ad in enumerate(ad_variants):
+            if not ad.image_prompt:
+                continue
             try:
-                generated_image_path = await generate_image(
-                    first_prompt,
+                path = await generate_image(
+                    ad.image_prompt,
                     aspect_ratio="1:1",
-                    output_path=image_path,
                 )
+                if path and path.exists():
+                    ad.image_path = str(path)
+                    logger.info("campaign: image for ad %s saved to %s", i + 1, ad.image_path)
             except Exception as e:
-                logger.warning("campaign: image generation failed: %s", e)
+                logger.warning(
+                    "campaign: image generation for ad %s failed: %s %s",
+                    i + 1,
+                    type(e).__name__,
+                    e or "(no message)",
+                )
 
     logger.info("campaign: generate_campaign done ads=%s", len(ad_variants))
     return CampaignDraft(
         analysis_result=analysis_result,
         ads=ad_variants,
         keywords=keywords,
-        image_path=str(generated_image_path) if generated_image_path and Path(generated_image_path).exists() else None,
     )

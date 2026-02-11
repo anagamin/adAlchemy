@@ -39,6 +39,7 @@ class AdVariant:
     visual_concept: str
     image_prompt_short: str
     image_prompt: str = ""
+    image_path: Optional[str] = None
 
 
 @dataclass
