@@ -13,6 +13,12 @@ class Settings(BaseSettings):
     gptunnel_api_key: str = ""
     gptunnel_image_model: str = "google-imagen-4"
 
+    mysql_host: str = "localhost"
+    mysql_port: int = 3306
+    mysql_user: str = ""
+    mysql_password: str = ""
+    mysql_database: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

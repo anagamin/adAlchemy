@@ -3,13 +3,24 @@ import io
 import logging
 import re
 from pathlib import Path
+from typing import Any
 
 from PIL import Image
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .campaign_generator import generate_campaign
 from .config import settings
+from .db import (
+    LOG_AD_TYPE,
+    LOG_ORDER,
+    LOG_ORDER_DONE,
+    LOG_START,
+    create_request,
+    create_results,
+    ensure_user,
+    log_action,
+)
 from .models import AdVariant, CampaignDraft
 from .vk_client import fetch_group_analysis
 
@@ -43,6 +54,19 @@ VK_LINK_PATTERN = re.compile(
 )
 
 
+def _ensure_user_kwargs(user: User | None) -> dict[str, Any]:
+    if user is None:
+        return {}
+    return {
+        "first_name": user.first_name,
+        "last_name": user.last_name,
+        "username": user.username,
+        "language_code": user.language_code,
+        "is_bot": user.is_bot,
+        "is_premium": getattr(user, "is_premium", None),
+    }
+
+
 def parse_user_input(text: str) -> tuple[str | None, str | None]:
     """Извлекает ссылку на группу VK и опциональный текст пожеланий из сообщения.
     Возвращает (link, user_wishes). Если ссылки нет — (None, None)."""
@@ -74,6 +98,8 @@ async def _run_campaign_task(
     app: Application,
     user_wishes: str | None = None,
     ad_type: str = AD_TYPE_SUBSCRIBERS,
+    user_id: int | None = None,
+    request_id: int | None = None,
 ) -> None:
     logger.info("task start chat_id=%s link=%s ad_type=%s", chat_id, link, ad_type)
     try:
@@ -81,6 +107,10 @@ async def _run_campaign_task(
         analysis = fetch_group_analysis(link, posts_count=50)
         logger.info("task: VK done group=%s posts=%s", analysis.group.name, len(analysis.posts))
         draft = await generate_campaign(analysis, user_wishes=user_wishes, ad_objective=ad_type)
+        if request_id is not None:
+            await create_results(request_id, draft)
+        if user_id is not None:
+            await log_action(user_id, LOG_ORDER_DONE)
         logger.info("task: campaign generated, sending to user")
         await _send_campaign(chat_id, draft, app)
         logger.info("task done chat_id=%s", chat_id)
@@ -223,6 +253,11 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
                 await app.bot.send_message(chat_id=chat_id, text=block)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user:
+        user_id = await ensure_user(user.id, **_ensure_user_kwargs(user))
+        if user_id is not None:
+            await log_action(user_id, LOG_START)
     await update.message.reply_text(
         "Выберите тип объявления:",
         reply_markup=AD_TYPE_KEYBOARD,
@@ -240,10 +275,22 @@ async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     pending_link = context.user_data.pop("pending_link", None)
     pending_wishes = context.user_data.pop("pending_wishes", None)
 
+    user_id = None
+    if update.effective_user:
+        user_id = await ensure_user(update.effective_user.id, **_ensure_user_kwargs(update.effective_user))
+        if user_id is not None:
+            await log_action(user_id, LOG_AD_TYPE if not pending_link else LOG_ORDER)
+
+    request_id = None
+    if pending_link and user_id is not None:
+        request_id = await create_request(user_id, pending_link, pending_wishes)
+
     if pending_link:
         await query.edit_message_text(CREATING_MESSAGE)
         app = context.application
-        asyncio.create_task(_run_campaign_task(chat_id, pending_link, app, pending_wishes, ad_type))
+        asyncio.create_task(
+            _run_campaign_task(chat_id, pending_link, app, pending_wishes, ad_type, user_id, request_id)
+        )
     else:
         await query.edit_message_text(
             "Тип объявления выбран. Отправьте ссылку на группу ВКонтакте (например, vk.com/group_name или vk.com/club123). "
@@ -272,10 +319,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     logger.info("handle_link chat_id=%s link=%s wishes=%s ad_type=%s", chat_id, link, bool(user_wishes), ad_type)
+
+    user_id = (
+        await ensure_user(update.effective_user.id, **_ensure_user_kwargs(update.effective_user))
+        if update.effective_user
+        else None
+    )
+    request_id = await create_request(user_id, link, user_wishes) if user_id is not None else None
+    if user_id is not None:
+        await log_action(user_id, LOG_ORDER)
+
     await update.message.reply_text(CREATING_MESSAGE)
 
     app = context.application
-    asyncio.create_task(_run_campaign_task(chat_id, link, app, user_wishes, ad_type))
+    asyncio.create_task(
+        _run_campaign_task(chat_id, link, app, user_wishes, ad_type, user_id, request_id)
+    )
 
 
 def build_application() -> Application:
