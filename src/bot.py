@@ -3,9 +3,11 @@ import io
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
+import jwt
 from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -26,6 +28,7 @@ from .db import (
     log_action,
 )
 from .models import AdVariant, CampaignDraft
+from .vk_ads_requests import build_publish_payload
 from .vk_client import fetch_group_analysis
 
 logger = logging.getLogger(__name__)
@@ -291,6 +294,26 @@ PHOTO_SEND_RETRIES = 3
 PHOTO_SEND_RETRY_DELAY = 3.0
 
 
+PUBLISH_JWT_EXPIRATION_SEC = 86400
+
+def _build_publish_vk_url(draft: CampaignDraft, ad_index: int) -> str | None:
+    if not settings.publish_base_url or not settings.publish_jwt_secret:
+        return None
+    try:
+        payload = build_publish_payload(draft, ad_index)
+        now = int(time.time())
+        token = jwt.encode(
+            {"data": payload, "iat": now, "exp": now + PUBLISH_JWT_EXPIRATION_SEC},
+            settings.publish_jwt_secret,
+            algorithm="HS256",
+        )
+        base = settings.publish_base_url.rstrip("/")
+        return f"{base}/vk-publish.php?payload={token}"
+    except Exception as e:
+        logger.warning("build_publish_vk_url failed: %s", e)
+        return None
+
+
 def _prepare_photo_for_telegram(path: str) -> bytes:
     with Image.open(path) as img:
         img = img.convert("RGB")
@@ -323,6 +346,12 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
 
     for i, ad in enumerate(draft.ads):
         block = chunks[summary_count + i] if summary_count + i < len(chunks) else _format_ad_block(ad, i + 1, draft)
+        publish_url = _build_publish_vk_url(draft, i)
+        ad_reply_markup = (
+            InlineKeyboardMarkup([[InlineKeyboardButton("Опубликовать в ВК", url=publish_url)]])
+            if publish_url
+            else None
+        )
         if ad.image_path:
             photo_bytes = None
             try:
@@ -343,31 +372,46 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
                         if attempt < PHOTO_SEND_RETRIES:
                             await asyncio.sleep(PHOTO_SEND_RETRY_DELAY)
                 if last_error is not None:
-                    await app.bot.send_message(chat_id=chat_id, text=block)
+                    await app.bot.send_message(chat_id=chat_id, text=block, reply_markup=ad_reply_markup)
                 else:
                     if len(block) > MESSAGE_LIMIT:
                         start = 0
                         while start < len(block):
-                            await app.bot.send_message(chat_id=chat_id, text=block[start : start + MESSAGE_LIMIT])
+                            part = block[start : start + MESSAGE_LIMIT]
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=part,
+                                reply_markup=ad_reply_markup if start + MESSAGE_LIMIT >= len(block) else None,
+                            )
                             start += MESSAGE_LIMIT
                     else:
-                        await app.bot.send_message(chat_id=chat_id, text=block)
+                        await app.bot.send_message(chat_id=chat_id, text=block, reply_markup=ad_reply_markup)
             else:
                 if len(block) > MESSAGE_LIMIT:
                     start = 0
                     while start < len(block):
-                        await app.bot.send_message(chat_id=chat_id, text=block[start : start + MESSAGE_LIMIT])
+                        part = block[start : start + MESSAGE_LIMIT]
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=part,
+                            reply_markup=ad_reply_markup if start + MESSAGE_LIMIT >= len(block) else None,
+                        )
                         start += MESSAGE_LIMIT
                 else:
-                    await app.bot.send_message(chat_id=chat_id, text=block)
+                    await app.bot.send_message(chat_id=chat_id, text=block, reply_markup=ad_reply_markup)
         else:
             if len(block) > MESSAGE_LIMIT:
                 start = 0
                 while start < len(block):
-                    await app.bot.send_message(chat_id=chat_id, text=block[start : start + MESSAGE_LIMIT])
+                    part = block[start : start + MESSAGE_LIMIT]
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=part,
+                        reply_markup=ad_reply_markup if start + MESSAGE_LIMIT >= len(block) else None,
+                    )
                     start += MESSAGE_LIMIT
             else:
-                await app.bot.send_message(chat_id=chat_id, text=block)
+                await app.bot.send_message(chat_id=chat_id, text=block, reply_markup=ad_reply_markup)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user

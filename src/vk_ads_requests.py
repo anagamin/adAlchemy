@@ -143,6 +143,44 @@ def build_vk_ads_requests(
     return requests_out
 
 
+def build_publish_payload(draft: CampaignDraft, ad_index: int) -> dict[str, Any]:
+    """
+    Builds a JSON-serializable payload for one ad to be passed to the publish
+    callback (e.g. JWT). Used for "Опубликовать в ВК" — create one campaign,
+    one ad group, one ad in user's VK Ads cabinet.
+    """
+    vk = _get_vk_campaign(draft)
+    segments = draft.analysis_result.get("audience_segments") or []
+    if not segments and draft.ads:
+        segments = [{"segment_name": ad.segment_name, "description": ""} for ad in draft.ads]
+    seg = segments[ad_index] if ad_index < len(segments) else (segments[0] if segments else {})
+    targeting = _targeting_for_segment(seg, vk)
+    if isinstance(targeting.get("regions"), str):
+        targeting["regions"] = [int(x.strip()) for x in str(targeting["regions"]).split(",") if x.strip()]
+    elif targeting.get("regions") is not None and not isinstance(targeting["regions"], list):
+        targeting["regions"] = list(targeting["regions"])
+    ad = draft.ads[ad_index]
+    campaign_name = vk.get("campaign_name") or draft.analysis_result.get("project_summary", "Кампания")[:100]
+    day_limit = int(vk.get("budget_daily_rub") or 500) * 100
+    all_limit = int(vk.get("budget_total_rub") or 0) * 100
+    link_url = vk.get("link_url") or "https://vk.com"
+    bid_rub = float(vk.get("bid_rub") or 15)
+    bid = int(bid_rub * 100)
+    return {
+        "campaign_name": campaign_name,
+        "day_limit": day_limit,
+        "all_limit": all_limit,
+        "link_url": link_url,
+        "bid": bid,
+        "targeting": targeting,
+        "ad": {
+            "name": (ad.headline or ad.segment_name or f"Объявление {ad_index + 1}")[:100],
+            "title": (ad.headline or "")[:80],
+            "description": (ad.body_text or "")[:800],
+        },
+    }
+
+
 def build_vk_ads_requests_with_placeholders_resolved(
     draft: CampaignDraft,
     account_id: str = "0",

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     mysql_password: str = ""
     mysql_database: str = ""
 
+    publish_base_url: str = ""
+    publish_jwt_secret: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
