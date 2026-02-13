@@ -10,9 +10,11 @@ from .models import AdVariant, CampaignDraft, GroupAnalysis
 from .prompts import (
     SYSTEM_ADS,
     SYSTEM_ANALYSIS,
+    SYSTEM_CONTENT_RECOMMENDATIONS,
     SYSTEM_IMAGE_PROMPT,
     build_user_ads,
     build_user_analysis,
+    build_user_content_recommendations,
     build_user_image_prompt,
 )
 
@@ -83,6 +85,36 @@ async def _step1_analysis(
     return out
 
 
+async def _step1b_content_recommendations(analysis_result: dict[str, Any]) -> list[dict[str, str]]:
+    logger.info("campaign: step1b_content_recommendations start")
+    analysis_json = json.dumps(analysis_result, ensure_ascii=False, indent=2)
+    user = build_user_content_recommendations(analysis_json)
+    raw = await chat_completion(
+        [
+            {"role": "system", "content": SYSTEM_CONTENT_RECOMMENDATIONS},
+            {"role": "user", "content": user},
+        ],
+        json_mode=True,
+    )
+    try:
+        data = extract_json_from_text(raw)
+    except Exception as e:
+        logger.warning(
+            "campaign: step1b extract_json failed: %s | raw_preview=%s", e, (raw or "")[:500]
+        )
+        return []
+    recs = data.get("recommendations") or []
+    if not isinstance(recs, list):
+        recs = [recs] if recs else []
+    recs = [
+        {"recommendation": r.get("recommendation", ""), "reason": r.get("reason", "")}
+        for r in recs
+        if isinstance(r, dict)
+    ]
+    logger.info("campaign: step1b_content_recommendations done count=%s", len(recs))
+    return recs
+
+
 async def _step2_ads(
     analysis_result: dict,
     user_wishes: str | None = None,
@@ -128,6 +160,9 @@ async def generate_campaign(
 ) -> CampaignDraft:
     logger.info("campaign: generate_campaign start objective=%s", ad_objective)
     analysis_result = await _step1_analysis(analysis, user_wishes=user_wishes, ad_objective=ad_objective)
+    content_recs = await _step1b_content_recommendations(analysis_result)
+    if content_recs:
+        analysis_result["content_recommendations"] = content_recs
     ads_raw = await _step2_ads(analysis_result, user_wishes=user_wishes, ad_objective=ad_objective)
     keywords = analysis_result.get("keywords") or []
 

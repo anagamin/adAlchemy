@@ -30,7 +30,7 @@ from .vk_client import fetch_group_analysis
 
 logger = logging.getLogger(__name__)
 
-CREATING_MESSAGE = "Ваше объявление создаётся. Вы получите результат, когда всё будет готово."
+CREATING_MESSAGE = "Ваше объявление создаётся. Вы получите результат, когда всё будет готово (около 3 минут)."
 
 AD_TYPE_SUBSCRIBERS = "subscribers"
 AD_TYPE_MESSAGES = "messages"
@@ -225,11 +225,27 @@ def _format_ad_block(ad: AdVariant, index: int, draft: CampaignDraft) -> str:
     return "\n".join(lines)
 
 
+def _format_content_recommendations(recs: list[dict[str, str]]) -> str:
+    lines = ["📝 Рекомендации по контенту группы\n"]
+    for i, r in enumerate(recs, 1):
+        rec = (r.get("recommendation") or "").strip()
+        reason = (r.get("reason") or "").strip()
+        if rec:
+            lines.append(f"{i}. {rec}")
+            if reason:
+                lines.append(f"   Обоснование: {reason}")
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _format_campaign_message(draft: CampaignDraft) -> list[str]:
     chunks = []
     summary = draft.analysis_result.get("project_summary")
     if summary:
         chunks.append("📊 Анализ группы\n\n" + summary)
+    content_recs = draft.analysis_result.get("content_recommendations")
+    if content_recs:
+        chunks.append(_format_content_recommendations(content_recs))
     if draft.keywords:
         chunks.append("🏷 Ключевые слова для таргета: " + ", ".join(draft.keywords[:20]))
 
@@ -270,7 +286,7 @@ def _draft_from_results(rows: list[dict[str, Any]], ad_objective: str = AD_TYPE_
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
 PHOTO_MAX_SIZE = 1024
-PHOTO_JPEG_QUALITY = 82
+PHOTO_JPEG_QUALITY = 75
 PHOTO_SEND_RETRIES = 3
 PHOTO_SEND_RETRY_DELAY = 3.0
 
@@ -289,7 +305,13 @@ def _prepare_photo_for_telegram(path: str) -> bytes:
 
 async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -> None:
     chunks = _format_campaign_message(draft)
-    summary_count = 2 if draft.keywords else 1
+    summary_count = sum(
+        [
+            1 if draft.analysis_result.get("project_summary") else 0,
+            1 if draft.analysis_result.get("content_recommendations") else 0,
+            1 if draft.keywords else 0,
+        ]
+    )
     for i, part in enumerate(chunks[:summary_count]):
         if len(part) > MESSAGE_LIMIT:
             start = 0
@@ -365,7 +387,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user_id is not None:
         await log_action(user_id, LOG_START)
     await update.message.reply_text(
-        "AdAlechemy проводит многофакторный анализ вашей группы VK — контент, аудитория, ниша — и на основе данных генерирует персонализированные рекламные кампании с высокой эффективностью. "
+        "AdAlechemy проводит многофакторный анализ вашей группы VK — контент, аудитория, ниша — и на основе данных генерирует рекомендации по ведению группы с учетом специфики целевой аудитории, а также персонализированные рекламные кампании с высокой эффективностью. Стоимость одной генерации (2 объявления) - 490 рублей."
         "Выберите тип объявления:",
         reply_markup=AD_TYPE_KEYBOARD,
     )
