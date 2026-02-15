@@ -23,6 +23,7 @@ pip install -r requirements.txt
 2. **Telegram:** создайте бота через [@BotFather](https://t.me/BotFather), укажите `TELEGRAM_BOT_TOKEN`.
 3. **VK:** access token с правами `groups` → `VK_ACCESS_TOKEN`.
 4. **LLM:** любой OpenAI-совместимый API (OpenAI, DeepSeek, Qwen). Укажите `LLM_API_KEY`, при необходимости `LLM_BASE_URL` и `LLM_MODEL`.
+5. **Пополнение баланса (YooKassa):** в личном кабинете [YooKassa](https://yookassa.ru) создайте магазин, получите `YOOKASSA_SHOP_ID` и `YOOKASSA_SECRET_KEY`. Выполните миграцию: `mysql ... < sql/payments.sql`. Для зачисления средств после оплаты нужен вебхук — либо PHP-скрипт на nginx (см. ниже), либо Python-сервер: `python -m src.webhook_server`.
 
 ## Запуск
 
@@ -32,6 +33,11 @@ python main.py
 
 Отправьте боту ссылку на группу ВК. Бот ответит «Ваше объявление создаётся», затем пришлёт: краткий анализ, ключевые слова и по каждому варианту объявления — заголовок, текст, CTA, визуальную концепцию и **промпт для генерации изображения**.
 
+**Пополнение баланса:** команда `/balance` — отображается текущий баланс и кнопка «Пополнить баланс». После выбора суммы (или ввода своей) бот присылает ссылку на оплату YooKassa. Для зачисления средств после оплаты нужен вебхук:
+
+- **Вариант 1 (nginx):** загрузите папку `webhook/` на сервер (yookassa_webhook.php и создайте из примера yookassa_webhook_config.php). В настройках магазина YooKassa укажите URL: `https://ваш-домен/путь/yookassa_webhook.php`.
+- **Вариант 2 (Python):** запустите `python -m src.webhook_server` и укажите в YooKassa URL вида `https://ваш-домен:8080/webhook/yookassa`.
+
 ## Структура
 
 - `src/vk_client.py` — данные группы и стены, engagement по формуле `(likes + comments*2 + reposts*3) / views`.
@@ -39,17 +45,7 @@ python main.py
 - `src/llm_client.py` — вызов OpenAI-совместимого chat completion (JSON и текст).
 - `src/campaign_generator.py` — асинхронный пайплайн: анализ → объявления → промпты для картинок.
 - `src/bot.py` — Telegram-бот, асинхронная отправка результата.
-
-## Публикация в ВК
-
-Рядом с каждым вариантом объявления в боте показывается кнопка **«Опубликовать в ВК»**. По нажатию открывается страница на вашем сервере, где пользователь входит через VK OAuth, после чего в его рекламном кабинете ВКонтакте создаётся одна кампания с одним объявлением (целевая аудитория, бюджет и текст берутся из выбранного варианта).
-
-**Настройка бота:** в `.env` задайте `PUBLISH_BASE_URL` (например `https://feedcraft.ru`) и `PUBLISH_JWT_SECRET` — общий секрет для подписи ссылок.
-
-**Размещение PHP:** положите `vk-publish.php` на сайт по адресу `{PUBLISH_BASE_URL}/vk-publish.php`. В окружении сервера (или в конфиге веб-сервера) задайте:
-
-- `VK_APP_ID`, `VK_APP_SECRET` — ID и секрет приложения ВКонтакте (тип « standalone »).
-- `PUBLISH_JWT_SECRET` — тот же секрет, что и в боте.
-- `PUBLISH_BASE_URL` — базовый URL сайта (для redirect_uri).
-
-В настройках приложения ВК укажите Redirect URI: `https://feedcraft.ru/vk-publish.php` (или ваш домен) и включите доступ к рекламе (права `ads`).
+- `src/yookassa_client.py` — создание платежей YooKassa (пополнение баланса).
+- `src/webhook_server.py` — HTTP-сервер для приёма уведомлений YooKassa (альтернатива PHP).
+- `webhook/yookassa_webhook.php` — вебхук YooKassa для nginx (пополнение баланса после оплаты).
+- `sql/payments.sql` — таблица платежей для пополнения баланса.

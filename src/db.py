@@ -263,6 +263,65 @@ async def get_user_balance(telegram_id: int) -> Optional[Any]:
             return row["balance"] if row else None
 
 
+async def add_balance(telegram_id: int, amount: float) -> bool:
+    await init_pool_if_needed()
+    if not _pool_ready() or amount <= 0:
+        return False
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE users SET balance = balance + %s WHERE telegram_id = %s",
+                (amount, telegram_id),
+            )
+            return cur.rowcount > 0
+
+
+async def create_payment_record(
+    yookassa_payment_id: str,
+    user_id: int,
+    telegram_id: int,
+    amount_rub: float,
+) -> bool:
+    await init_pool_if_needed()
+    if not _pool_ready():
+        return False
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """INSERT INTO payments (yookassa_payment_id, user_id, telegram_id, amount_rub, status)
+                   VALUES (%s, %s, %s, %s, 'pending')""",
+                (yookassa_payment_id, user_id, telegram_id, amount_rub),
+            )
+            return True
+
+
+async def get_payment_by_yookassa_id(yookassa_payment_id: str) -> Optional[dict[str, Any]]:
+    await init_pool_if_needed()
+    if not _pool_ready():
+        return None
+    async with get_conn() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT id, user_id, telegram_id, amount_rub, status FROM payments WHERE yookassa_payment_id = %s",
+                (yookassa_payment_id,),
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def set_payment_succeeded(yookassa_payment_id: str) -> bool:
+    await init_pool_if_needed()
+    if not _pool_ready():
+        return False
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE payments SET status = 'succeeded' WHERE yookassa_payment_id = %s AND status = 'pending'",
+                (yookassa_payment_id,),
+            )
+            return cur.rowcount > 0
+
+
 async def get_last_requests(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
     await init_pool_if_needed()
     if not _pool_ready():

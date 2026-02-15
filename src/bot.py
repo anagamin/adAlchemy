@@ -3,11 +3,9 @@ import io
 import json
 import logging
 import re
-import time
 from pathlib import Path
 from typing import Any
 
-import jwt
 from PIL import Image
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, User
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -19,6 +17,7 @@ from .db import (
     LOG_ORDER,
     LOG_ORDER_DONE,
     LOG_START,
+    create_payment_record,
     create_request,
     create_results,
     ensure_user,
@@ -28,8 +27,8 @@ from .db import (
     log_action,
 )
 from .models import AdVariant, CampaignDraft
-from .vk_ads_requests import build_publish_payload
 from .vk_client import fetch_group_analysis
+from .yookassa_client import create_payment as yookassa_create_payment
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +63,13 @@ BUSY_MESSAGE = "Дождись окончания генерации"
 GENERATION_STATE_KEY = "generation_state"
 INFO_REQUEST_IDS_KEY = "info_request_ids"
 BALANCE_TOPUP_CALLBACK = "balance:topup"
+BALANCE_AMOUNT_PREFIX = "balance:amount:"
+BALANCE_AMOUNT_CUSTOM = "balance:amount:custom"
+EXPECT_BALANCE_AMOUNT_KEY = "expect_balance_amount"
+
+BALANCE_AMOUNTS = [500, 1000, 2000, 5000]
+MIN_TOPUP = 100
+MAX_TOPUP = 100_000
 
 
 def _ensure_user_kwargs(user: User | None) -> dict[str, Any]:
@@ -294,26 +300,6 @@ PHOTO_SEND_RETRIES = 3
 PHOTO_SEND_RETRY_DELAY = 3.0
 
 
-PUBLISH_JWT_EXPIRATION_SEC = 86400
-
-def _build_publish_vk_url(draft: CampaignDraft, ad_index: int) -> str | None:
-    if not settings.publish_base_url or not settings.publish_jwt_secret:
-        return None
-    try:
-        payload = build_publish_payload(draft, ad_index)
-        now = int(time.time())
-        token = jwt.encode(
-            {"data": payload, "iat": now, "exp": now + PUBLISH_JWT_EXPIRATION_SEC},
-            settings.publish_jwt_secret,
-            algorithm="HS256",
-        )
-        base = settings.publish_base_url.rstrip("/")
-        return f"{base}/vk-publish.php?payload={token}"
-    except Exception as e:
-        logger.warning("build_publish_vk_url failed: %s", e)
-        return None
-
-
 def _prepare_photo_for_telegram(path: str) -> bytes:
     with Image.open(path) as img:
         img = img.convert("RGB")
@@ -346,12 +332,6 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
 
     for i, ad in enumerate(draft.ads):
         block = chunks[summary_count + i] if summary_count + i < len(chunks) else _format_ad_block(ad, i + 1, draft)
-        publish_url = _build_publish_vk_url(draft, i)
-        ad_reply_markup = (
-            InlineKeyboardMarkup([[InlineKeyboardButton("Опубликовать в ВК", url=publish_url)]])
-            if publish_url
-            else None
-        )
         if ad.image_path:
             photo_bytes = None
             try:
@@ -372,46 +352,34 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
                         if attempt < PHOTO_SEND_RETRIES:
                             await asyncio.sleep(PHOTO_SEND_RETRY_DELAY)
                 if last_error is not None:
-                    await app.bot.send_message(chat_id=chat_id, text=block, reply_markup=ad_reply_markup)
+                    await app.bot.send_message(chat_id=chat_id, text=block)
                 else:
                     if len(block) > MESSAGE_LIMIT:
                         start = 0
                         while start < len(block):
                             part = block[start : start + MESSAGE_LIMIT]
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=part,
-                                reply_markup=ad_reply_markup if start + MESSAGE_LIMIT >= len(block) else None,
-                            )
+                            await app.bot.send_message(chat_id=chat_id, text=part)
                             start += MESSAGE_LIMIT
                     else:
-                        await app.bot.send_message(chat_id=chat_id, text=block, reply_markup=ad_reply_markup)
+                        await app.bot.send_message(chat_id=chat_id, text=block)
             else:
                 if len(block) > MESSAGE_LIMIT:
                     start = 0
                     while start < len(block):
                         part = block[start : start + MESSAGE_LIMIT]
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=part,
-                            reply_markup=ad_reply_markup if start + MESSAGE_LIMIT >= len(block) else None,
-                        )
+                        await app.bot.send_message(chat_id=chat_id, text=part)
                         start += MESSAGE_LIMIT
                 else:
-                    await app.bot.send_message(chat_id=chat_id, text=block, reply_markup=ad_reply_markup)
+                    await app.bot.send_message(chat_id=chat_id, text=block)
         else:
             if len(block) > MESSAGE_LIMIT:
                 start = 0
                 while start < len(block):
                     part = block[start : start + MESSAGE_LIMIT]
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=part,
-                        reply_markup=ad_reply_markup if start + MESSAGE_LIMIT >= len(block) else None,
-                    )
+                    await app.bot.send_message(chat_id=chat_id, text=part)
                     start += MESSAGE_LIMIT
             else:
-                await app.bot.send_message(chat_id=chat_id, text=block, reply_markup=ad_reply_markup)
+                await app.bot.send_message(chat_id=chat_id, text=block)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -489,11 +457,131 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+def _balance_amount_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(f"{a} ₽", callback_data=f"{BALANCE_AMOUNT_PREFIX}{a}") for a in BALANCE_AMOUNTS],
+        [InlineKeyboardButton("Другая сумма", callback_data=BALANCE_AMOUNT_CUSTOM)],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 async def handle_balance_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if query.data == BALANCE_TOPUP_CALLBACK:
-        await query.edit_message_reply_markup(reply_markup=None)
+    if query.data != BALANCE_TOPUP_CALLBACK:
+        return
+    if not settings.yookassa_shop_id or not settings.yookassa_secret_key:
+        await query.edit_message_text("Пополнение временно недоступно. Настройте YooKassa в конфигурации.")
+        return
+    await query.edit_message_text(
+        "Выберите сумму пополнения (₽) или укажите свою:",
+        reply_markup=_balance_amount_keyboard(),
+    )
+
+
+def _user_full_name(user: User | None) -> str:
+    if not user:
+        return ""
+    parts = [user.first_name or "", user.last_name or ""]
+    return " ".join(p for p in parts if p).strip()
+
+
+async def _do_create_payment_and_send_link(
+    chat_id: int,
+    user_id: int,
+    telegram_id: int,
+    amount_rub: float,
+    bot,
+    customer_full_name: str | None = None,
+) -> bool:
+    url, payment_id = await yookassa_create_payment(
+        amount_rub, telegram_id, customer_full_name=customer_full_name
+    )
+    if not url or not payment_id:
+        await bot.send_message(
+            chat_id,
+            "Не удалось создать платёж. Проверьте в .env значения YOOKASSA_SHOP_ID и YOOKASSA_SECRET_KEY "
+            "и посмотрите логи бота — там будет причина ошибки.",
+        )
+        return False
+    await create_payment_record(payment_id, user_id, telegram_id, amount_rub)
+    await bot.send_message(
+        chat_id,
+        f"Оплатите {amount_rub:.2f} ₽ по ссылке. После успешной оплаты баланс пополнится автоматически.\n\n{url}",
+    )
+    return True
+
+
+async def handle_balance_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == BALANCE_AMOUNT_CUSTOM:
+        context.user_data[EXPECT_BALANCE_AMOUNT_KEY] = True
+        await query.edit_message_text(
+            f"Введите сумму пополнения в рублях (от {MIN_TOPUP} до {MAX_TOPUP} ₽):"
+        )
+        return
+    if not data.startswith(BALANCE_AMOUNT_PREFIX):
+        return
+    try:
+        amount = int(data[len(BALANCE_AMOUNT_PREFIX) :])
+    except ValueError:
+        return
+    if amount < MIN_TOPUP or amount > MAX_TOPUP:
+        await query.edit_message_text(f"Сумма должна быть от {MIN_TOPUP} до {MAX_TOPUP} ₽.")
+        return
+    user = update.effective_user
+    if not user:
+        return
+    user_id = await ensure_user(user.id, **_ensure_user_kwargs(user))
+    if user_id is None:
+        await query.edit_message_text("Ошибка: не удалось определить пользователя.")
+        return
+    await query.edit_message_text("Создаём платёж...")
+    ok = await _do_create_payment_and_send_link(
+        update.effective_chat.id,
+        user_id,
+        user.id,
+        float(amount),
+        context.bot,
+        customer_full_name=_user_full_name(user),
+    )
+    if not ok:
+        await query.edit_message_text("Не удалось создать платёж. Выберите сумму снова:", reply_markup=_balance_amount_keyboard())
+
+
+async def handle_balance_amount_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.pop(EXPECT_BALANCE_AMOUNT_KEY, False):
+        return False
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        amount = float(text)
+    except ValueError:
+        await update.message.reply_text("Введите число (например 1500 или 2000.50):")
+        return True
+    if amount < MIN_TOPUP or amount > MAX_TOPUP:
+        await update.message.reply_text(f"Сумма должна быть от {MIN_TOPUP} до {MAX_TOPUP} ₽.")
+        return True
+    user = update.effective_user
+    if not user:
+        return True
+    user_id = await ensure_user(user.id, **_ensure_user_kwargs(user))
+    if user_id is None:
+        await update.message.reply_text("Ошибка: не удалось определить пользователя.")
+        return True
+    await update.message.reply_text("Создаём платёж...")
+    ok = await _do_create_payment_and_send_link(
+        update.effective_chat.id,
+        user_id,
+        user.id,
+        amount,
+        context.bot,
+        customer_full_name=_user_full_name(user),
+    )
+    if not ok:
+        await update.message.reply_text("Введите сумму ещё раз (от 100 до 100000):")
+    return True
 
 
 async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -537,6 +625,9 @@ async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
+    if context.user_data.get(EXPECT_BALANCE_AMOUNT_KEY):
+        await handle_balance_amount_message(update, context)
+        return
     request_ids: list[int] = context.user_data.get(INFO_REQUEST_IDS_KEY) or []
     if request_ids and text.isdigit():
         num = int(text)
@@ -594,6 +685,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def _on_shutdown(_app: Application) -> None:
+    from .db import close_pool
+    await close_pool()
+
+
 def build_application() -> Application:
     from telegram.request import HTTPXRequest
 
@@ -607,12 +703,19 @@ def build_application() -> Application:
         Application.builder()
         .token(settings.telegram_bot_token)
         .request(request)
+        .post_shutdown(_on_shutdown)
         .build()
     )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CallbackQueryHandler(handle_balance_topup, pattern=f"^{re.escape(BALANCE_TOPUP_CALLBACK)}$"))
+    app.add_handler(
+        CallbackQueryHandler(
+            handle_balance_amount,
+            pattern=f"^({re.escape(BALANCE_AMOUNT_CUSTOM)}|{re.escape(BALANCE_AMOUNT_PREFIX)}\\d+)$",
+        )
+    )
     app.add_handler(CallbackQueryHandler(handle_ad_type, pattern=f"^({AD_TYPE_SUBSCRIBERS}|{AD_TYPE_MESSAGES})$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     return app

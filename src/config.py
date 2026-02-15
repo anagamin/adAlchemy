@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -19,12 +19,18 @@ class Settings(BaseSettings):
     mysql_password: str = ""
     mysql_database: str = ""
 
-    publish_base_url: str = ""
-    publish_jwt_secret: str = ""
+    vk_app_secret: str = ""
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    yookassa_shop_id: str = ""
+    yookassa_secret_key: str = ""
+    yookassa_return_url: str = "https://t.me"
+    yookassa_receipt_email: str = ""
+    yookassa_webhook_port: int = 8080
+    yookassa_webhook_path: str = "/webhook/yookassa"
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
 
 
 settings = Settings()
