@@ -17,9 +17,11 @@ from .db import (
     LOG_ORDER,
     LOG_ORDER_DONE,
     LOG_START,
+    add_balance,
     create_payment_record,
     create_request,
     create_results,
+    deduct_balance,
     ensure_user,
     get_last_requests,
     get_results_for_request,
@@ -55,12 +57,84 @@ REGION_IDS_TO_NAMES: dict[str, str] = {
 }
 
 VK_LINK_PATTERN = re.compile(
-    r"(https?://)?(www\.)?vk\.com/[^\s]+",
+    r"(https?://)?(www\.)?vk\.(com|ru)/[^\s]+",
     re.IGNORECASE,
 )
 
 BUSY_MESSAGE = "Дождись окончания генерации"
 GENERATION_STATE_KEY = "generation_state"
+GENERATION_COST_RUB = 500
+INSUFFICIENT_BALANCE_MESSAGE = (
+    f"Недостаточно средств на балансе. Стоимость одной генерации — {GENERATION_COST_RUB} ₽. "
+    "Пополните баланс командой /balance."
+)
+
+WELCOME_MESSAGE = """🚀 Добро пожаловать в AI-ассистент по рекламе ВКонтакте
+
+Этот бот помогает владельцам групп и бизнесу во ВКонтакте создавать эффективные рекламные кампании за несколько минут.
+
+Вы отправляете ссылку на группу —
+мы анализируем её контент, вовлеченность и позиционирование —
+и выдаём готовые рекламные решения, которые можно сразу запускать.
+
+🎁 Первая генерация — бесплатно
+
+Чтобы вы могли оценить качество работы, 1 генерация доступна бесплатно.
+Дальнейшие генерации стоят 500 ₽.
+
+🔍 Что входит в генерацию кампании:
+
+✔ Анализ вашей группы
+✔ Рекомендации по улучшению контента и повышению вовлеченности
+✔ 2 готовые рекламные кампании, каждая из которых включает:
+рекламный текст
+заголовок
+ключевые слова / сегменты аудитории
+обоснование выбранной стратегии
+уникальное рекламное изображение
+
+Вы получаете не просто текст, а готовый рекламный инструмент с логикой и расчетом.
+
+✍️ Можно добавить уточнения
+Вместе со ссылкой на группу вы можете указать дополнительные пожелания.
+
+Например:
+«используй новогоднюю тематику»
+«сделай акцент на наличии диплома у специалиста»
+«сфокусируйся на скидке»
+«ориентируйся на молодую аудиторию»
+
+Бот учтёт эти детали при анализе и создании кампаний.
+
+📌 Почему это полезно?
+
+Экономит время на анализ и подготовку рекламы
+Помогает находить новые аудитории
+Позволяет тестировать разные рекламные подходы
+Стоит дешевле, чем услуги таргетолога
+
+Подходит для:
+малого бизнеса
+администраторов групп
+самозанятых
+SMM-специалистов
+
+📋 Меню бота
+
+/start — показать это сообщение
+/create — создать рекламную кампанию
+/info — список ваших созданных кампаний
+/balance — проверить баланс и пополнить счёт
+
+💰 Стоимость одной генерации: 500 ₽
+
+Оплата происходит с внутреннего баланса бота.
+
+Если у вас есть вопросы или предложения — пишите напрямую:
+📩 @anagam1n
+
+Готовы протестировать рекламу для своей группы?
+Введите команду /create и начнём 🚀"""
 INFO_REQUEST_IDS_KEY = "info_request_ids"
 BALANCE_TOPUP_CALLBACK = "balance:topup"
 BALANCE_AMOUNT_PREFIX = "balance:amount:"
@@ -162,9 +236,12 @@ async def _run_campaign_task(
     ad_type: str = AD_TYPE_SUBSCRIBERS,
     user_id: int | None = None,
     request_id: int | None = None,
+    telegram_id: int | None = None,
 ) -> None:
     logger.info("task start chat_id=%s link=%s ad_type=%s", chat_id, link, ad_type)
     try:
+        if not link or not str(link).strip():
+            raise ValueError("Ссылка на группу не указана. Отправьте ссылку на группу ВКонтакте (например, vk.com/group_name).")
         logger.info("task: fetching VK group analysis")
         analysis = fetch_group_analysis(link, posts_count=50)
         logger.info("task: VK done group=%s posts=%s", analysis.group.name, len(analysis.posts))
@@ -184,9 +261,15 @@ async def _run_campaign_task(
     except ValueError as e:
         logger.warning("task error (ValueError): %s", e)
         await app.bot.send_message(chat_id=chat_id, text=f"Ошибка: {e}")
+        if telegram_id is not None:
+            await add_balance(telegram_id, GENERATION_COST_RUB)
+            await app.bot.send_message(chat_id=chat_id, text=f"Сумма {GENERATION_COST_RUB} ₽ возвращена на баланс.")
     except Exception as e:
         logger.exception("task failed: %s", e)
         await app.bot.send_message(chat_id=chat_id, text=f"Произошла ошибка: {e}")
+        if telegram_id is not None:
+            await add_balance(telegram_id, GENERATION_COST_RUB)
+            await app.bot.send_message(chat_id=chat_id, text=f"Сумма {GENERATION_COST_RUB} ₽ возвращена на баланс.")
     finally:
         _clear_generation_state(app, chat_id)
 
@@ -383,6 +466,14 @@ async def _send_campaign(chat_id: int, draft: CampaignDraft, app: Application) -
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    if user:
+        await ensure_user(user.id, **_ensure_user_kwargs(user))
+    if update.message:
+        await update.message.reply_text(WELCOME_MESSAGE)
+
+
+async def cmd_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
     user_id = None
     if user:
         user_id = await ensure_user(user.id, **_ensure_user_kwargs(user))
@@ -390,7 +481,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = chat.id if chat else None
     app = context.application
     if chat_id is not None and _is_generation_active(app, chat_id):
-        logger.info("start: generation active chat_id=%s, informing user", chat_id)
+        logger.info("cmd_create: generation active chat_id=%s, informing user", chat_id)
         if update.message:
             await update.message.reply_text(BUSY_MESSAGE)
         else:
@@ -398,8 +489,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if user_id is not None:
         await log_action(user_id, LOG_START)
+    balance = await get_user_balance(user.id) if user else None
+    if balance is None:
+        balance = 0
+    try:
+        balance_val = float(balance)
+    except (TypeError, ValueError):
+        balance_val = 0
+    balance_str = f"{balance_val:.2f}"
+    if balance_val < GENERATION_COST_RUB:
+        await update.message.reply_text(
+            f"Ваш баланс: {balance_str} ₽\n\n{INSUFFICIENT_BALANCE_MESSAGE}"
+        )
+        return
     await update.message.reply_text(
-        "AdAlechemy проводит многофакторный анализ вашей группы VK — контент, аудитория, ниша — и на основе данных генерирует рекомендации по ведению группы с учетом специфики целевой аудитории, а также персонализированные рекламные кампании с высокой эффективностью. Стоимость одной генерации (2 объявления) - 490 рублей."
+        f"Ваш баланс: {balance_str} ₽. Стоимость генерации — {GENERATION_COST_RUB} ₽.\n\n"
+        "AdAlechemy проводит многофакторный анализ вашей группы VK — контент, аудитория, ниша — и на основе данных генерирует рекомендации по ведению группы с учетом специфики целевой аудитории, а также персонализированные рекламные кампании с высокой эффективностью. "
         "Выберите тип объявления:",
         reply_markup=AD_TYPE_KEYBOARD,
     )
@@ -601,24 +706,33 @@ async def handle_ad_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     pending_wishes = context.user_data.pop("pending_wishes", None)
 
     user_id = None
+    telegram_id = update.effective_user.id if update.effective_user else None
     if update.effective_user:
         user_id = await ensure_user(update.effective_user.id, **_ensure_user_kwargs(update.effective_user))
         if user_id is not None:
             await log_action(user_id, LOG_AD_TYPE if not pending_link else LOG_ORDER)
 
-    request_id = None
-    if pending_link and user_id is not None:
+    if pending_link and user_id is not None and telegram_id is not None:
+        if not await deduct_balance(telegram_id, GENERATION_COST_RUB):
+            await query.edit_message_text(INSUFFICIENT_BALANCE_MESSAGE)
+            context.user_data["pending_link"] = pending_link
+            context.user_data["pending_wishes"] = pending_wishes
+            return
         request_id = await create_request(user_id, pending_link, pending_wishes)
-
-    if pending_link:
         await query.edit_message_text(CREATING_MESSAGE)
         _register_generation(app, chat_id, request_id)
         asyncio.create_task(
-            _run_campaign_task(chat_id, pending_link, app, pending_wishes, ad_type, user_id, request_id)
+            _run_campaign_task(
+                chat_id, pending_link, app, pending_wishes, ad_type, user_id, request_id, telegram_id
+            )
         )
+    elif pending_link:
+        context.user_data["pending_link"] = pending_link
+        context.user_data["pending_wishes"] = pending_wishes
+        await query.edit_message_text("Ошибка: не удалось определить пользователя.")
     else:
         await query.edit_message_text(
-            "Тип объявления выбран. Отправьте ссылку на группу ВКонтакте (например, vk.com/group_name или vk.com/club123). "
+            "Тип объявления выбран. Отправьте ссылку на группу ВКонтакте (например, vk.com/group_name или vk.ru/club123). "
             "Можно добавить текст с пожеланиями по рекламной кампании."
         )
 
@@ -645,7 +759,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     link, user_wishes = parse_user_input(text)
     if not link:
         await update.message.reply_text(
-            "Отправьте корректную ссылку на группу ВКонтакте (содержит vk.com). "
+            "Отправьте корректную ссылку на группу ВКонтакте (vk.com или vk.ru). "
             "Можно добавить к сообщению текст с пожеланиями по кампании."
         )
         return
@@ -668,20 +782,25 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     logger.info("handle_link chat_id=%s link=%s wishes=%s ad_type=%s", chat_id, link, bool(user_wishes), ad_type)
 
-    user_id = (
-        await ensure_user(update.effective_user.id, **_ensure_user_kwargs(update.effective_user))
-        if update.effective_user
-        else None
-    )
-    request_id = await create_request(user_id, link, user_wishes) if user_id is not None else None
-    if user_id is not None:
-        await log_action(user_id, LOG_ORDER)
+    user = update.effective_user
+    if not user:
+        await update.message.reply_text("Ошибка: не удалось определить пользователя.")
+        return
+    user_id = await ensure_user(user.id, **_ensure_user_kwargs(user))
+    telegram_id = user.id
+    if user_id is None:
+        await update.message.reply_text("Ошибка: не удалось определить пользователя.")
+        return
+    await log_action(user_id, LOG_ORDER)
+    if not await deduct_balance(telegram_id, GENERATION_COST_RUB):
+        await update.message.reply_text(INSUFFICIENT_BALANCE_MESSAGE)
+        return
+    request_id = await create_request(user_id, link, user_wishes)
 
     await update.message.reply_text(CREATING_MESSAGE)
-
     _register_generation(app, chat_id, request_id)
     asyncio.create_task(
-        _run_campaign_task(chat_id, link, app, user_wishes, ad_type, user_id, request_id)
+        _run_campaign_task(chat_id, link, app, user_wishes, ad_type, user_id, request_id, telegram_id)
     )
 
 
@@ -707,6 +826,7 @@ def build_application() -> Application:
         .build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("create", cmd_create))
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CallbackQueryHandler(handle_balance_topup, pattern=f"^{re.escape(BALANCE_TOPUP_CALLBACK)}$"))

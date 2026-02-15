@@ -9,6 +9,8 @@ LOG_AD_TYPE = "выбор типа объявления"
 LOG_ORDER = "заказ"
 LOG_ORDER_DONE = "заказ выполнен"
 
+INITIAL_BALANCE_RUB = 500
+
 import aiomysql
 
 from .config import settings
@@ -161,9 +163,10 @@ async def ensure_user(
                     language_code,
                     is_bot,
                     is_premium
-                ) VALUES (%s, 0, %s, %s, %s, %s, %s, %s)""",
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     telegram_id,
+                    INITIAL_BALANCE_RUB,
                     _truncate(first_name, 255),
                     _truncate(last_name, 255),
                     _truncate(username, 255),
@@ -272,6 +275,20 @@ async def add_balance(telegram_id: int, amount: float) -> bool:
             await cur.execute(
                 "UPDATE users SET balance = balance + %s WHERE telegram_id = %s",
                 (amount, telegram_id),
+            )
+            return cur.rowcount > 0
+
+
+async def deduct_balance(telegram_id: int, amount: float) -> bool:
+    """Atomically deduct amount from user balance. Returns True if deduction succeeded (balance was >= amount)."""
+    await init_pool_if_needed()
+    if not _pool_ready() or amount <= 0:
+        return False
+    async with get_conn() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE users SET balance = balance - %s WHERE telegram_id = %s AND balance >= %s",
+                (amount, telegram_id, amount),
             )
             return cur.rowcount > 0
 
